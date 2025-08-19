@@ -1,0 +1,7 @@
+python 3.11.9 
+librarians
+pip install PyQt5 requests netifaces
+
+
+          A better version will be made. for termux, ISH.
+      
