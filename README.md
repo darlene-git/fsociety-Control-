@@ -1,2 +1,920 @@
-# fsociety-Control-
-python 
+# fsociety control v0.1
+import socket
+import threading
+import time
+import subprocess
+import re
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget,
+                             QPushButton, QTextEdit, QLabel, QListWidget,
+                             QTabWidget, QHBoxLayout, QLineEdit, QMessageBox,
+                             QComboBox, QProgressBar, QGroupBox, QFileDialog)
+from PyQt5.QtCore import pyqtSignal, QObject, Qt, QSize
+from PyQt5.QtGui import QFont, QPixmap, QIcon
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import netifaces
+import os
+import requests
+import json
+import uuid
+import base64
+from urllib.parse import quote
+
+
+class NetworkScanner(QObject):
+    update_signal = pyqtSignal(str, str, dict)
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal()
+    control_signal = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self._is_running = False
+        self.max_threads = 200
+        self.timeout = 1.0
+        self.known_devices = set()
+        self.device_commands = {
+            'TV': {
+                'Aç (WOL)': 'POWER_ON',
+                'Kapat': 'POWER_OFF',
+                'Ses Artır': 'VOLUME_UP',
+                'Ses Azalt': 'VOLUME_DOWN',
+                'Kanal Artır': 'CHANNEL_UP',
+                'Kanal Azalt': 'CHANNEL_DOWN',
+                'Resim Gönder': 'SEND_IMAGE',
+                'YouTube Aç': 'OPEN_YOUTUBE',
+                'Netflix Aç': 'OPEN_NETFLIX'
+            },
+            'Telefon': {
+                'Bilgi Göster': 'SHOW_INFO',
+                'Bağlantı Kes': 'DISCONNECT',
+                'Web Sayfası Aç': 'OPEN_WEBPAGE'
+            },
+            'Bilgisayar': {
+                'Uyarı Gönder': 'SEND_ALERT',
+                'Kapat': 'SHUTDOWN',
+                'Yeniden Başlat': 'RESTART'
+            },
+            'Akıllı Lamba': {
+                'Aç': 'LIGHT_ON',
+                'Kapat': 'LIGHT_OFF',
+                'Parlaklık Artır': 'BRIGHTNESS_UP',
+                'Parlaklık Azalt': 'BRIGHTNESS_DOWN'
+            }
+        }
+
+    def stop(self):
+        self._is_running = False
+
+    def get_network_info(self):
+        interfaces = {}
+        for iface in netifaces.interfaces():
+            addrs = netifaces.ifaddresses(iface)
+            if netifaces.AF_INET in addrs:
+                for addr_info in addrs[netifaces.AF_INET]:
+                    if 'addr' in addr_info and 'netmask' in addr_info:
+                        ip = addr_info['addr']
+                        if not ip.startswith('127.'):
+                            interfaces[iface] = {
+                                'ip': ip,
+                                'netmask': addr_info['netmask'],
+                                'mac': netifaces.ifaddresses(iface).get(netifaces.AF_LINK, [{}])[0].get('addr', '')
+                            }
+        return interfaces
+
+    def calculate_ip_range(self, ip, netmask):
+        ip_parts = list(map(int, ip.split('.')))
+        mask_parts = list(map(int, netmask.split('.')))
+        network = [ip_parts[i] & mask_parts[i] for i in range(4)]
+        start_ip = f"{network[0]}.{network[1]}.{network[2]}.1"
+        end_ip = f"{network[0]}.{network[1]}.{network[2]}.254"
+        return start_ip, end_ip
+
+    def scan(self):
+        self._is_running = True
+        self.known_devices.clear()
+        interfaces = self.get_network_info()
+        if not interfaces:
+            self.update_signal.emit('ERROR', '', {'message': 'Ağ bağlantısı bulunamadı!'})
+            return
+
+        with ThreadPoolExecutor(max_workers=self.max_threads) as executor:
+            futures = []
+            for iface, info in interfaces.items():
+                start_ip, end_ip = self.calculate_ip_range(info['ip'], info['netmask'])
+                base_ip = '.'.join(start_ip.split('.')[:3]) + '.'
+                start = int(start_ip.split('.')[-1])
+                end = int(end_ip.split('.')[-1])
+                chunk_size = 20
+                for chunk_start in range(start, end + 1, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, end + 1)
+                    futures.append(
+                        executor.submit(
+                            self.scan_ip_range,
+                            base_ip,
+                            chunk_start,
+                            chunk_end,
+                            info['mac']
+                        )
+                    )
+            total = len(futures)
+            for i, future in enumerate(as_completed(futures), 1):
+                try:
+                    future.result()
+                    self.progress_signal.emit(int((i / total) * 100))
+                except Exception as e:
+                    continue
+        self.finished_signal.emit()
+
+    def scan_ip_range(self, base_ip, start, end, mac_address):
+        for i in range(start, end):
+            if not self._is_running:
+                return
+            ip = f"{base_ip}{i}"
+            if ip in self.known_devices:
+                continue
+            try:
+                subprocess.run(['ping', '-n', '1', '-w', '100', ip],
+                               capture_output=True, shell=True, timeout=0.2)
+            except:
+                continue
+            device_info = self.detect_device(ip)
+            if device_info:
+                self.known_devices.add(ip)
+                self.update_signal.emit('DEVICE', ip, device_info)
+
+    def detect_device(self, ip):
+        device = {'ip': ip, 'type': 'Bilinmeyen', 'ports': []}
+        common_ports = {
+            'TV': [8001, 8080, 9197, 55000, 8008, 3000, 1925, 9080],
+            'Telefon': [62078, 5353, 32414, 8085, 8086],
+            'Bilgisayar': [80, 443, 445, 3389, 5357, 22, 21, 23],
+            'Akıllı Lamba': [38899, 8899, 5984]
+        }
+        for device_type, ports in common_ports.items():
+            for port in ports:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                        s.settimeout(0.2)
+                        result = s.connect_ex((ip, port))
+                        if result == 0:
+                            device['type'] = device_type
+                            device['ports'].append(port)
+                            if device_type == 'TV':
+                                tv_info = self.detect_tv_info(ip, port)
+                                if tv_info:
+                                    device.update(tv_info)
+                            elif device_type == 'Akıllı Lamba':
+                                device['brand'] = self.detect_light_brand(ip, port)
+                            break
+                except:
+                    continue
+        device['mac'] = self.get_mac_address(ip)
+        if device['mac']:
+            vendor = self.get_vendor_from_mac(device['mac'])
+            if vendor:
+                device['vendor'] = vendor
+                if 'TV' in vendor or 'Samsung' in vendor or 'LG' in vendor:
+                    device['type'] = 'TV'
+                elif 'Phone' in vendor or 'Mobile' in vendor or 'Apple' in vendor:
+                    device['type'] = 'Telefon'
+                elif 'Philips' in vendor or 'Hue' in vendor:
+                    device['type'] = 'Akıllı Lamba'
+        return device
+
+    def detect_tv_info(self, ip, port):
+        info = {}
+        try:
+            if port == 8001:
+                response = requests.get(f"http://{ip}:8001/api/v2/", timeout=1)
+                if response.status_code == 200:
+                    info['brand'] = 'Samsung'
+                    data = response.json()
+                    device_info = data.get('device', {})
+                    info['model'] = device_info.get('modelName', 'Bilinmeyen Model')
+                    info['name'] = device_info.get('name', 'Samsung TV')
+                    info['os'] = device_info.get('OS', 'Tizen')
+                    info['support'] = {
+                        'power': True,
+                        'volume': True,
+                        'apps': True
+                    }
+            elif port == 8080:
+                response = requests.get(f"http://{ip}:8080/roap/api/data", timeout=1)
+                if response.status_code == 200:
+                    info['brand'] = 'LG'
+                    data = response.json()
+                    info['model'] = data.get('product_name', 'Bilinmeyen Model')
+                    info['name'] = data.get('friendly_name', 'LG TV')
+                    info['os'] = 'webOS'
+                    info['support'] = {
+                        'power': True,
+                        'volume': True,
+                        'apps': True
+                    }
+            elif port == 9197:
+                headers = {
+                    'Content-Type': 'text/xml; charset="utf-8"',
+                    'SOAPAction': '"urn:schemas-upnp-org:service:AVTransport:1#GetDeviceCapabilities"'
+                }
+                body = """
+                <?xml version="1.0"?>
+                <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+                <s:Body>
+                    <u:GetDeviceCapabilities xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">
+                    <InstanceID>0</InstanceID>
+                    </u:GetDeviceCapabilities>
+                </s:Body>
+                </s:Envelope>
+                """
+                response = requests.post(f"http://{ip}:9197/upnp/control/AVTransport1",
+                                         headers=headers, data=body, timeout=1)
+                if response.status_code == 200:
+                    info['brand'] = 'UPnP TV'
+                    info['support'] = {
+                        'power': True,
+                        'volume': True
+                    }
+        except:
+            pass
+        return info
+
+    def detect_light_brand(self, ip, port):
+        try:
+            if port == 38899:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1)
+                s.connect((ip, port))
+                s.send(b'{"id":1,"method":"get_prop","params":["power"]}\r\n')
+                data = s.recv(1024)
+                if b'"result"' in data:
+                    return 'Yeelight'
+            elif port == 8899:
+                response = requests.get(f"http://{ip}/api/newdeveloper", timeout=1)
+                if response.status_code == 200:
+                    return 'Philips Hue'
+        except:
+            pass
+        return 'Bilinmeyen'
+
+    def get_mac_address(self, ip):
+        try:
+            pid = subprocess.Popen(["arp", "-a", ip], stdout=subprocess.PIPE, shell=True)
+            s = pid.communicate()[0].decode('utf-8')
+            match = re.search(r"([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})", s)
+            if match:
+                return match.group(0).upper()
+        except:
+            pass
+        return None
+
+    def get_vendor_from_mac(self, mac):
+        oui = mac[:8].upper()
+        vendors = {
+            '00:15:99': 'Samsung Electronics',
+            '00:12:47': 'Samsung Electronics',
+            '00:1E:7D': 'LG Electronics',
+            '00:18:13': 'LG Electronics',
+            '00:24:BE': 'Sony Corporation',
+            '00:13:15': 'Sony Corporation',
+            '00:03:93': 'Apple',
+            '00:16:CB': 'Apple',
+            '00:17:88': 'Philips Lighting',
+            '00:1A:22': 'Philips Healthcare',
+            '7C:49:EB': 'TP-Link',
+            'A4:17:31': 'Samsung Electronics',
+            'B4:0B:44': 'Xiaomi Communications'
+        }
+        return vendors.get(oui, 'Bilinmeyen Üretici')
+
+    def control_device(self, ip, device_type, command, extra=None):
+        try:
+            if device_type == 'TV':
+                self.control_tv(ip, command, extra)
+            elif device_type == 'Telefon':
+                self.control_phone(ip, command, extra)
+            elif device_type == 'Bilgisayar':
+                self.control_computer(ip, command)
+            elif device_type == 'Akıllı Lamba':
+                self.control_light(ip, command)
+        except Exception as e:
+            self.control_signal.emit(ip, f"Hata: {str(e)}")
+
+    def control_tv(self, ip, command, extra=None):
+        device_info = self.found_devices.get(ip, {})
+        brand = device_info.get('brand', '')
+        if command == 'POWER_ON':
+            self.wake_on_lan(ip)
+            self.control_signal.emit(ip, "TV açma komutu (WOL) gönderildi")
+        elif command == 'POWER_OFF':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_POWEROFF')
+            elif brand == 'LG':
+                self.lg_tv_command(ip, 'POWER')
+            else:
+                self.wake_on_lan(ip, power_off=True)
+        elif command == 'VOLUME_UP':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_VOLUP')
+            elif brand == 'LG':
+                self.lg_tv_command(ip, 'VOLUMEUP')
+        elif command == 'VOLUME_DOWN':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_VOLDOWN')
+            elif brand == 'LG':
+                self.lg_tv_command(ip, 'VOLUMEDOWN')
+        elif command == 'CHANNEL_UP':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_CHUP')
+            elif brand == 'LG':
+                self.lg_tv_command(ip, 'CHANNELUP')
+        elif command == 'CHANNEL_DOWN':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_CHDOWN')
+            elif brand == 'LG':
+                self.lg_tv_command(ip, 'CHANNELDOWN')
+        elif command == 'OPEN_YOUTUBE':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_YOUTUBE')
+            elif brand == 'LG':
+                self.lg_tv_launch_app(ip, 'youtube.leanback.v4')
+        elif command == 'OPEN_NETFLIX':
+            if brand == 'Samsung':
+                self.samsung_tv_command(ip, 'KEY_NETFLIX')
+            elif brand == 'LG':
+                self.lg_tv_launch_app(ip, 'netflix')
+        elif command == 'SEND_IMAGE' and extra:
+            if brand == 'Samsung':
+                self.send_image_to_samsung_tv(ip, extra)
+            elif brand == 'LG':
+                self.control_signal.emit(ip, "LG TV'ye resim gönderme desteklenmiyor")
+            else:
+                self.control_signal.emit(ip, "Bu TV markası için resim gönderme desteklenmiyor")
+
+    def samsung_tv_command(self, ip, key):
+        try:
+            headers = {'Content-Type': 'application/xml'}
+            body = f"""
+            <UIC>
+                <X_EventTag>key</X_EventTag>
+                <key>{key}</key>
+            </UIC>
+            """
+            response = requests.post(f"http://{ip}:8001/api/v2/UIC",
+                                     headers=headers, data=body, timeout=3)
+            if response.status_code == 200:
+                self.control_signal.emit(ip, f"Samsung TV komutu başarılı: {key}")
+            else:
+                self.control_signal.emit(ip, f"Samsung TV komut hatası: {response.status_code}")
+        except Exception as e:
+            self.control_signal.emit(ip, f"Samsung TV komut hatası: {str(e)}")
+
+    def lg_tv_command(self, ip, command):
+        try:
+            headers = {'Content-Type': 'application/atom+xml'}
+            url = f"http://{ip}:8080/roap/api/command"
+            data = f"""
+            <command>
+                <name>HandleKeyInput</name>
+                <value>{command}</value>
+            </command>
+            """
+            response = requests.post(url, headers=headers, data=data, timeout=3)
+            if response.status_code == 200:
+                self.control_signal.emit(ip, f"LG TV komutu başarılı: {command}")
+            else:
+                self.control_signal.emit(ip, f"LG TV komut hatası: {response.status_code}")
+        except Exception as e:
+            self.control_signal.emit(ip, f"LG TV komut hatası: {str(e)}")
+
+    def lg_tv_launch_app(self, ip, app_id):
+        try:
+            headers = {'Content-Type': 'application/atom+xml'}
+            url = f"http://{ip}:8080/roap/api/command"
+            data = f"""
+            <command>
+                <name>AppExecute</name>
+                <value>{app_id}</value>
+            </command>
+            """
+            response = requests.post(url, headers=headers, data=data, timeout=3)
+            if response.status_code == 200:
+                self.control_signal.emit(ip, f"LG TV uygulama başlatıldı: {app_id}")
+            else:
+                self.control_signal.emit(ip, f"LG TV uygulama hatası: {response.status_code}")
+        except Exception as e:
+            self.control_signal.emit(ip, f"LG TV uygulama hatası: {str(e)}")
+
+    def send_image_to_samsung_tv(self, ip, image_path):
+        try:
+            with open(image_path, 'rb') as f:
+                files = {'file': (os.path.basename(image_path), f, 'image/jpeg')}
+                response = requests.post(f"http://{ip}:8001/api/v2/uploads",
+                                         files=files, timeout=10)
+                if response.status_code == 200:
+                    self.control_signal.emit(ip, f"Resim başarıyla gönderildi: {image_path}")
+                else:
+                    self.control_signal.emit(ip, f"Resim gönderme hatası: {response.status_code}")
+        except Exception as e:
+            self.control_signal.emit(ip, f"Resim gönderme hatası: {str(e)}")
+
+    def control_phone(self, ip, command, extra=None):
+        if command == 'SHOW_INFO':
+            self.control_signal.emit(ip, "Telefon bilgisi isteği gönderildi")
+        elif command == 'DISCONNECT':
+            self.control_signal.emit(ip, "Telefon bağlantısı kesme isteği gönderildi")
+        elif command == 'OPEN_WEBPAGE' and extra:
+            try:
+                url = f"http://{ip}:8085/open?url={quote(extra)}"
+                response = requests.get(url, timeout=3)
+                if response.status_code == 200:
+                    self.control_signal.emit(ip, f"Web sayfası açıldı: {extra}")
+            except:
+                self.control_signal.emit(ip, "Telefon web sayfası açma desteklenmiyor")
+
+    def control_computer(self, ip, command):
+        if command == 'SHUTDOWN':
+            try:
+                subprocess.run(['shutdown', '/s', '/m', f'\\\\{ip}', '/t', '0'], shell=True)
+                self.control_signal.emit(ip, "Bilgisayar kapatma komutu gönderildi")
+            except:
+                self.control_signal.emit(ip, "Bilgisayar kapatma hatası")
+        elif command == 'RESTART':
+            try:
+                subprocess.run(['shutdown', '/r', '/m', f'\\\\{ip}', '/t', '0'], shell=True)
+                self.control_signal.emit(ip, "Bilgisayar yeniden başlatma komutu gönderildi")
+            except:
+                self.control_signal.emit(ip, "Bilgisayar yeniden başlatma hatası")
+        elif command == 'SEND_ALERT':
+            try:
+                msg = "Ağ yöneticinizden önemli bir mesaj var!"
+                subprocess.run(['msg', '*', '/SERVER:{ip}', msg], shell=True)
+                self.control_signal.emit(ip, "Uyarı mesajı gönderildi")
+            except:
+                self.control_signal.emit(ip, "Uyarı mesajı gönderme hatası")
+
+    def control_light(self, ip, command):
+        device_info = self.found_devices.get(ip, {})
+        brand = device_info.get('brand', '')
+        if brand == 'Yeelight':
+            self.control_yeelight(ip, command)
+        elif brand == 'Philips Hue':
+            self.control_philips_hue(ip, command)
+        else:
+            self.control_signal.emit(ip, "Bu lamba markası desteklenmiyor")
+
+    def control_yeelight(self, ip, command):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            s.connect((ip, 55443))
+            if command == 'LIGHT_ON':
+                cmd = '{"id":1,"method":"set_power","params":["on", "smooth", 500]}\r\n'
+            elif command == 'LIGHT_OFF':
+                cmd = '{"id":1,"method":"set_power","params":["off", "smooth", 500]}\r\n'
+            elif command == 'BRIGHTNESS_UP':
+                cmd = '{"id":1,"method":"set_bright","params":[100, "smooth", 500]}\r\n'
+            elif command == 'BRIGHTNESS_DOWN':
+                cmd = '{"id":1,"method":"set_bright","params":[10, "smooth", 500]}\r\n'
+            s.send(cmd.encode())
+            response = s.recv(1024)
+            if b'"result"' in response:
+                self.control_signal.emit(ip, f"Yeelight komutu başarılı: {command}")
+            else:
+                self.control_signal.emit(ip, f"Yeelight komut hatası")
+            s.close()
+        except Exception as e:
+            self.control_signal.emit(ip, f"Yeelight komut hatası: {str(e)}")
+
+    def control_philips_hue(self, ip, command):
+        try:
+            url = f"http://{ip}/api/newdeveloper/lights/1/state"
+            data = {}
+            if command == 'LIGHT_ON':
+                data['on'] = True
+            elif command == 'LIGHT_OFF':
+                data['on'] = False
+            elif command == 'BRIGHTNESS_UP':
+                data['bri'] = 254
+            elif command == 'BRIGHTNESS_DOWN':
+                data['bri'] = 50
+            response = requests.put(url, json=data, timeout=3)
+            if response.status_code == 200:
+                self.control_signal.emit(ip, f"Philips Hue command successful: {command}")
+            else:
+                self.control_signal.emit(ip, f"Philips Hue command error: {response.status_code}")
+        except Exception as e:
+            self.control_signal.emit(ip, f"Philips Hue command error: {str(e)}")
+
+    def wake_on_lan(self, ip, power_off=False):
+        mac = self.get_mac_address(ip)
+        if not mac:
+            self.control_signal.emit(ip, "MAC address not found, WOL sending failed")
+            return
+        mac_bytes = bytes.fromhex(mac.replace(':', ''))
+        if power_off:
+            magic_packet = b'\xff' * 6 + mac_bytes * 16 + b'\x00\x00\x00\x00'
+        else:
+            magic_packet = b'\xff' * 6 + mac_bytes * 16
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                for _ in range(3):
+                    s.sendto(magic_packet, ('255.255.255.255', 9))
+                    s.sendto(magic_packet, ('255.255.255.255', 7))
+                    time.sleep(0.1)
+            if power_off:
+                self.control_signal.emit(ip, "Shutdown command sent (with WOL)")
+            else:
+                self.control_signal.emit(ip,"Walk command sent (WOL)")
+        except Exception as e:
+            self.control_signal.emit(ip, f"WOL error: {str(e)}")
+
+
+class DeviceControllerGUI(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Ağ Cihaz Kontrol Merkezi")
+        self.setGeometry(100, 100, 1000, 800)
+        self.setWindowIcon(QIcon('fsociety_icon.png'))
+        self.scanner = NetworkScanner()
+        self.scanner.update_signal.connect(self.update_device_list)
+        self.scanner.progress_signal.connect(self.update_progress)
+        self.scanner.finished_signal.connect(self.scan_finished)
+        self.scanner.control_signal.connect(self.show_control_result)
+        self.found_devices = {}
+        self.current_device = None
+        self.init_ui()
+        self.apply_dark_theme()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        main_layout = QVBoxLayout()
+        self.fsociety_logo = QLabel()
+        pixmap = QPixmap('fsociety_logo.png')
+        self.fsociety_logo.setPixmap(pixmap.scaled(150, 150, Qt.KeepAspectRatio))
+        self.fsociety_logo.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.fsociety_logo)
+        title = QLabel("Fsociety v1 ")
+        title.setFont(QFont('Arial', 16, QFont.Bold))
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("color: #00ff00; margin-bottom: 15px;")
+        main_layout.addWidget(title)
+        control_panel = QGroupBox("Scan Controls")
+        control_layout = QHBoxLayout()
+        self.start_btn = QPushButton("start scan")
+        self.start_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3d3d3d;
+                color: #ffffff;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #66c4c1;
+            }
+        """)
+        self.start_btn.clicked.connect(self.start_scan)
+        self.stop_btn = QPushButton("stop scanning")
+        self.stop_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3a3d3d;
+                color: #ffffff;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #73d9d9;
+            }
+        """)
+        self.stop_btn.clicked.connect(self.stop_scan)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #0f0f0f;
+                border-radius: 5px;
+                text-align: center;
+                height: 20px;
+                background-color: #0f0f0f;
+                color: #00ff00;
+            }
+            QProgressBar::chunk {
+                background-color: #46b09e;
+                width: 10px;
+            }
+        """)
+        control_layout.addWidget(self.start_btn)
+        control_layout.addWidget(self.stop_btn)
+        control_layout.addWidget(self.progress_bar)
+        control_panel.setLayout(control_layout)
+        main_layout.addWidget(control_panel)
+        content_layout = QHBoxLayout()
+        device_list_panel = QGroupBox("Bulunan Cihazlar")
+        device_list_layout = QVBoxLayout()
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Cihaz filtrele...")
+        self.filter_input.setStyleSheet("""
+            QLineEdit {
+                padding: 5px;
+                background-color: #103b38;
+                color: #83fcec;
+                border: 1px solid #228079;
+            }
+        """)
+        self.filter_input.textChanged.connect(self.filter_devices)
+        self.device_list = QListWidget()
+        self.device_list.setStyleSheet("""
+            QListWidget {
+                font-size: 12px;
+                border: 1px solid #6cf5f0;
+                background-color: #030303;
+                color: #00ff00;
+            }
+            QListWidget::item {
+                padding: 8px;
+                border-bottom: 1px solid #333333;
+            }
+            QListWidget::item:selected {
+                background: #62fcf2;
+                color: white;
+            }
+        """)
+        self.device_list.itemClicked.connect(self.show_device_details)
+        device_list_layout.addWidget(self.filter_input)
+        device_list_layout.addWidget(self.device_list)
+        device_list_panel.setLayout(device_list_layout)
+        content_layout.addWidget(device_list_panel, 30)
+        device_control_panel = QGroupBox("Device Details and Control")
+        device_control_layout = QVBoxLayout()
+        self.device_details = QTextEdit()
+        self.device_details.setReadOnly(True)
+        self.device_details.setStyleSheet("""
+            font-family: Consolas;
+            font-size: 12px;
+            border: 1px solid #27e8e2;
+            background-color: #080808;
+            color: #00ff00;
+            padding: 5px;
+        """)
+        self.control_combo = QComboBox()
+        self.control_combo.setStyleSheet("""
+            QComboBox {
+                padding: 5px;
+                background-color: #2c3e50;
+                color: #00ff00;
+                border: 1px solid #00ff00;
+            }
+            QComboBox::drop-down {
+                border-left: 1px solid #00ff00;
+            }
+            QComboBox::down-arrow {
+                image: url(down_arrow_green.png);
+            }
+        """)
+        self.control_btn = QPushButton("Komut Gönder")
+        self.control_btn.setStyleSheet("""
+            QPushButton {
+                background-color:#187d78;
+                color: #ffffff;
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: ;
+            }
+        """)
+        self.control_btn.clicked.connect(self.send_control_command)
+        self.image_btn = QPushButton("Resim Seç ve Gönder")
+        self.image_btn.setStyleSheet("""
+            QPushButton {
+                background-color:#578d8f ;
+                color: #08484a;
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5fb7ba;
+            }
+        """)
+        self.image_btn.clicked.connect(self.select_image)
+        self.image_btn.setEnabled(False)
+        self.web_input = QLineEdit()
+        self.web_input.setPlaceholderText("Web page URL (must start with http://)")
+        self.web_input.setStyleSheet("""
+            QLineEdit {
+                padding: 5px;
+                background-color: #5fb7ba;
+                color: #5fb7ba;
+                border: 1px solid #24d4bf;
+            }
+        """)
+        self.web_input.setVisible(False)
+        self.web_btn = QPushButton
+        self.web_btn.setStyleSheet("""("Open Web Page")
+            QPushButton {
+                background-color: #16b59a;
+                color: #88bdb4;
+                padding: 8px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1bd1bc;
+            }
+        """)
+        self.web_btn.clicked.connect(self.open_webpage)
+        self.web_btn.setVisible(False)
+        self.control_result = QTextEdit()
+        self.control_result.setReadOnly(True)
+        self.control_result.setStyleSheet("""
+            font-family: Consolas;
+            font-size: 11px;
+            background-color: #0a0a0a;
+            color: #136113;
+            border: 1px solid #4a0404;
+            padding: 5px;
+        """)
+        device_control_layout.addWidget(self.device_details)
+        device_control_layout.addWidget(QLabel("Control Commands:"))
+        device_control_layout.addWidget(self.control_combo)
+        device_control_layout.addWidget(self.control_btn)
+        device_control_layout.addWidget(self.image_btn)
+        device_control_layout.addWidget(self.web_input)
+        device_control_layout.addWidget(self.web_btn)
+        device_control_layout.addWidget(QLabel("Control Results:"))
+        device_control_layout.addWidget(self.control_result)
+        device_control_panel.setLayout(device_control_layout)
+        content_layout.addWidget(device_control_panel, 70)
+        main_layout.addLayout(content_layout)
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
+
+    def apply_dark_theme(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background-color: #050505;
+                color: #8efc68;
+            }
+            QGroupBox {
+                border: 1px solid #49fc49;
+                border-radius: 5px;
+                margin-top: 10px;
+                font-weight: bold;
+                font-size: 14px;
+                color: #65e0d2;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 5px;
+            }
+            QLabel {
+                color:#dfe655;
+            }
+        """)
+
+    def start_scan(self):
+        self.found_devices.clear()
+        self.device_list.clear()
+        self.device_details.clear()
+        self.control_result.clear()
+        self.progress_bar.setValue(0)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self.scan_thread = threading.Thread(target=self.scanner.scan)
+        self.scan_thread.start()
+
+    def stop_scan(self):
+        self.scanner.stop()
+        if hasattr(self, 'scan_thread') and self.scan_thread.is_alive():
+            self.scan_thread.join(timeout=1.0)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.show_control_result(
+            "Scanning Stopped",
+            "Scan stopped at user request."
+        )
+
+    def update_device_list(self, device_type, ip, device_info):
+        if device_type == 'ERROR':
+            QMessageBox.critical(self, "Hata", device_info.get('message', "An unknown error occurred."))
+            return
+        self.found_devices[ip] = device_info
+        display_text = f"{device_info.get('type', 'unknown')} - {ip}"
+        self.device_list.addItem(display_text)
+
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+
+    def scan_finished(self):
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self.show_control_result(
+            "Scan Completed",
+            "Network scan completed successfully."
+        )
+
+    def show_device_details(self, item):
+        ip = item.text().split(' - ')[-1]
+        self.current_device = self.found_devices.get(ip)
+        if not self.current_device:
+            self.device_details.setText("Device information not found.")
+            return
+
+        details = f"""
+        ip address: {self.current_device.get('ip', 'N/A')}
+        device type: {self.current_device.get('type', 'N/A')}
+       MAC Address: {self.current_device.get('mac', 'N/A')}
+        Manufacturer: {self.current_device.get('vendor', 'N/A')}
+        open ports: {', '.join(map(str, self.current_device.get('ports', [])))}
+        """
+        if self.current_device.get('brand'):
+            details += f"\nMarka: {self.current_device.get('brand')}"
+        if self.current_device.get('model'):
+            details += f"\nModel: {self.current_device.get('model')}"
+        if self.current_device.get('name'):
+            details += f"\nAdı: {self.current_device.get('name')}"
+        if self.current_device.get('os'):
+            details += f"\nOS: {self.current_device.get('os')}"
+
+        self.device_details.setText(details.strip())
+
+        self.control_combo.clear()
+        device_type = self.current_device.get('type')
+        commands = self.scanner.device_commands.get(device_type, {})
+        for name in commands:
+            self.control_combo.addItem(name)
+
+        self.image_btn.setEnabled('send picture' in commands)
+        self.web_input.setVisible('Open Web Page' in commands)
+        self.web_btn.setVisible('Open Web Page' in commands)
+
+    def send_control_command(self):
+        if not self.current_device:
+            QMessageBox.warning(self, "Warning: Please select a device from the list first..")
+            return
+
+        selected_command_name = self.control_combo.currentText()
+        device_type = self.current_device.get('type')
+        command_map = self.scanner.device_commands.get(device_type, {})
+        command = command_map.get(selected_command_name)
+
+        if command:
+            extra_data = None
+            if command == 'SEND_IMAGE':
+                extra_data, _ = QFileDialog.getOpenFileName(self,"Select Image", "", "Image Files"
+                                                                                     " (*.png *.jpg *.jpeg)")
+            elif command == 'OPEN_WEBPAGE':
+                extra_data = self.web_input.text()
+
+            if extra_data or command not in ['SEND_IMAGE', 'OPEN_WEBPAGE']:
+                self.scanner.found_devices = self.found_devices
+                self.scanner.control_device(self.current_device['ip'], device_type, command, extra_data)
+
+    def open_webpage(self):
+        if not self.current_device:
+            QMessageBox.warning(self, "Warning", "Please select a device from the list first.")
+            return
+
+        url = self.web_input.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Warning", "Please enter a URL.")
+            return
+
+        self.scanner.found_devices = self.found_devices
+        self.scanner.control_device(self.current_device['ip'], self.current_device['type'], 'OPEN_WEBPAGE', url)
+
+    def select_image(self):
+        if not self.current_device:
+            QMessageBox.warning(self, "Warning", "Please select a device from the list first.")
+            return
+
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Image Files (*.png *.jpg *.jpeg)")
+        if file_path:
+            self.scanner.found_devices = self.found_devices
+            self.scanner.control_device(self.current_device['ip'], self.current_device['type'], 'SEND_IMAGE', file_path)
+
+    def show_control_result(self, ip, message):
+        self.control_result.append(f"[{ip}] {message}")
+
+    def filter_devices(self):
+        filter_text = self.filter_input.text().lower()
+        for i in range(self.device_list.count()):
+            item = self.device_list.item(i)
+            item.setHidden(filter_text not in item.text().lower())
+
+
+if __name__ == '__main__':
+    # fsociety logosunu eklemeyi unutmayın (fsociety_logo.png)
+    app = QApplication([])
+    window = DeviceControllerGUI()
+    window.show()
+    app.exec_()
