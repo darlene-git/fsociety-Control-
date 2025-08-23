@@ -1,0 +1,4 @@
+git clone https://github.com/darlene-git/fsociety-Control-.git
+cd fsociety-Control-
+pip install -r requirements.txt
+python fsociety.py
