@@ -2,3 +2,7 @@ git clone https://github.com/darlene-git/fsociety-Control-.git
 cd fsociety-Control-
 pip install -r requirements.txt
 python fsociety.py
+  
+If you get an error
+python3 -m venv fsociety-env
+source fsociety-env/bin/activate
